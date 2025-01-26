@@ -3,15 +3,30 @@ import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-import matplotlib
-matplotlib.use('TkAgg')
 import networkx as nx
-import matplotlib.pyplot as plt
 from gerador import generate_dataset
+
+
+# Modelo GNN para otimização
+class ReactionOptimizerGNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(ReactionOptimizerGNN, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, output_dim)
+        self.fc = nn.Linear(output_dim, 1)  # Saída final para avaliar cada aresta
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = torch.relu(self.conv1(x, edge_index))
+        x = torch.relu(self.conv2(x, edge_index))
+        edge_scores = self.fc(x)  # Predição final para cada aresta
+        return edge_scores
+
 
 def convert_crn_to_graph(crn):
     nodes = crn['nodes']
     edges = crn['edges']
+
     node_to_idx = {node: i for i, node in enumerate(nodes)}
     reaction_nodes = []
     graph_edges = []
@@ -20,6 +35,7 @@ def convert_crn_to_graph(crn):
         reaction_node = f"R{i}"
         reaction_idx = len(nodes) + len(reaction_nodes)
         reaction_nodes.append(reaction_node)
+
         for input_node in inputs:
             graph_edges.append((node_to_idx[input_node], reaction_idx))
         graph_edges.append((reaction_idx, node_to_idx[output]))
@@ -29,46 +45,78 @@ def convert_crn_to_graph(crn):
     node_features = torch.eye(len(all_nodes))
     return Data(x=node_features, edge_index=edge_index), all_nodes
 
-class ReactionOptimizerGNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(ReactionOptimizerGNN, self).__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, output_dim)
-        self.fc = nn.Linear(output_dim, 1)
-
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        x = torch.relu(self.conv1(x, edge_index))
-        x = torch.relu(self.conv2(x, edge_index))
-        x = torch.relu(self.conv3(x, edge_index))
-        edge_scores = self.fc(x)
-        return edge_scores
-
 
 def generate_synthetic_labels(crn):
+    """
+    Gera rótulos sintéticos para uma CRN.
+    Marcamos arestas como importantes se forem críticas para alcançar um produto final.
+
+    Args:
+        crn (dict): A CRN para a qual os rótulos serão gerados.
+
+    Returns:
+        list: Lista de rótulos (0 ou 1) para cada aresta.
+    """
     labels = []
+    final_products = {'G', 'Z'}  # Definimos produtos finais importantes
     for inputs, output in crn['edges']:
-        # Arestas com mais reagentes ou conectadas ao produto final têm maior prioridade
-        labels.append(1 if len(inputs) > 1 else 0)
+        if output in final_products or len(inputs) > 2:
+            labels.append(1)
+        else:
+            labels.append(0)
     return labels
 
 
+def adjust_model_to_graph(model, input_dim):
+    """
+    Ajusta dinamicamente o modelo para a dimensão de entrada do grafo.
+
+    Args:
+        model (ReactionOptimizerGNN): Modelo original.
+        input_dim (int): Dimensão de entrada do grafo atual.
+
+    Returns:
+        ReactionOptimizerGNN: Modelo ajustado.
+    """
+    hidden_dim = model.conv1.out_channels
+    output_dim = model.conv2.out_channels
+
+    # Recria o modelo com a nova dimensão de entrada
+    new_model = ReactionOptimizerGNN(input_dim, hidden_dim, output_dim)
+    
+    # Copia os pesos das camadas que não mudaram
+    with torch.no_grad():
+        if model.conv1.in_channels == input_dim:
+            new_model.conv1 = model.conv1
+        new_model.conv2 = model.conv2
+        new_model.fc = model.fc
+
+    return new_model
+
+
+
 def train_model(synthetic_crns):
+    """
+    Treina o modelo com CRNs sintéticas.
+
+    Args:
+        synthetic_crns (list): Lista de CRNs sintéticas.
+
+    Returns:
+        ReactionOptimizerGNN: Modelo treinado.
+    """
     hidden_dim = 16
     output_dim = 16
     model = None
     optimizer = None
-    positive_weight = torch.tensor([2.0])  # Pesa mais as arestas importantes
-    criterion = nn.BCEWithLogitsLoss(pos_weight=positive_weight)
+    criterion = nn.BCEWithLogitsLoss()
 
-
-    for epoch in range(100):
+    for epoch in range(300):  # Aumentado para 300 épocas
         epoch_loss = 0
 
         for crn in synthetic_crns:
             # Converte a CRN para grafo
-            data, _ = convert_crn_to_graph(crn)
+            data, all_nodes = convert_crn_to_graph(crn)
             input_dim = data.x.shape[1]
 
             # Gera rótulos sintéticos
@@ -77,16 +125,16 @@ def train_model(synthetic_crns):
                 dtype=torch.float
             ).unsqueeze(1)
 
-            # Recria o modelo se o número de nós mudar
+            # Cria ou ajusta o modelo
             if model is None or model.conv1.in_channels != input_dim:
                 model = ReactionOptimizerGNN(input_dim, hidden_dim, output_dim)
-                optimizer = optim.Adam(model.parameters(), lr=0.01)
+                optimizer = optim.Adam(model.parameters(), lr=0.005)  # Taxa de aprendizado reduzida
 
             # Treinamento
             model.train()
             optimizer.zero_grad()
-            predictions = torch.sigmoid(model(data))
-            predictions = predictions[:target_labels.size(0)]
+            predictions = model(data)
+            predictions = predictions[:target_labels.size(0)]  # Ajusta para o tamanho das arestas
             loss = criterion(predictions, target_labels)
             loss.backward()
             optimizer.step()
@@ -96,126 +144,87 @@ def train_model(synthetic_crns):
         if epoch % 10 == 0:
             print(f"Epoch {epoch}, Average Loss: {epoch_loss / len(synthetic_crns):.4f}")
 
-    print("Treinamento concluído!")
     return model
 
-def optimize_crn(crn, model_template):
-    """
-    Otimiza uma rede de reações químicas (CRN) combinando reações intermediárias em uma única reação.
 
-    Args:
-        crn (dict): Um dicionário contendo 'nodes' (lista de moléculas) e 'edges' (lista de reações).
-        model_template (nn.Module): Um modelo base treinado.
 
-    Returns:
-        dict: CRN otimizada com reações consolidadas.
-    """
-    # Converte a CRN para o formato de grafo
-    data, all_nodes = convert_crn_to_graph(crn)
-
-    # Ajusta o modelo para o número de nós da CRN atual
-    input_dim = data.x.shape[1]
-    hidden_dim = model_template.conv1.out_channels
-    output_dim = model_template.fc.in_features
-
-    # Recria o modelo com dimensões compatíveis
-    model = ReactionOptimizerGNN(input_dim, hidden_dim, output_dim)
-
-    # Ajusta os pesos do modelo treinado para corresponder às novas dimensões
-    pretrained_state = model_template.state_dict()
-    current_state = model.state_dict()
-
-    # Atualiza apenas os pesos compatíveis
-    for name, param in pretrained_state.items():
-        if name in current_state and param.size() == current_state[name].size():
-            current_state[name].copy_(param)
-
-    model.load_state_dict(current_state)
-
-    # Usa o modelo para prever a importância das arestas
-    model.eval()
-    with torch.no_grad():
-        predictions = torch.sigmoid(model(data))
-
-    # Seleciona as arestas mais importantes (acima de um limiar)
-    threshold = 0.3
-    selected_edges = [
-        crn['edges'][i] for i, score in enumerate(predictions[:len(crn['edges'])])
-        if score.item() > threshold
-    ]
-
-    # Constrói um grafo com as arestas selecionadas
+def consolidate_reactions(nodes, edges):
     reaction_graph = nx.DiGraph()
-    for inputs, output in selected_edges:
+    for inputs, output in edges:
         for inp in inputs:
             reaction_graph.add_edge(inp, output)
 
-    # Encontra caminhos completos para o produto final
-    final_product = 'G'  # Supondo que 'G' seja sempre o produto final
-    all_paths = []
-    for node in crn['nodes']:
-        if reaction_graph.has_node(node):
-            try:
-                paths = nx.all_simple_paths(reaction_graph, source=node, target=final_product)
-                all_paths.extend(paths)
-            except nx.NetworkXNoPath:
-                pass
+    components = [list(c) for c in nx.weakly_connected_components(reaction_graph)]
+    optimized_edges = []
 
-    # Consolida os caminhos em uma única reação
-    if all_paths:
-        combined_reaction = ([], final_product)
-        for path in all_paths:
-            combined_reaction[0].extend(path[:-1])  # Adiciona todos os reagentes do caminho
-        combined_reaction = (list(set(combined_reaction[0])), final_product)  # Remove duplicatas
+    for component in components:
+        reactants = [n for n in component if reaction_graph.in_degree(n) > 0]
+        product = [n for n in component if reaction_graph.out_degree(n) == 0]
+        if product:
+            optimized_edges.append((reactants, product[0]))
 
-        # Retorna a CRN otimizada com uma única reação consolidada
-        return {
-            'nodes': crn['nodes'],
-            'edges': [combined_reaction]
-        }
-    else:
-        # Se nenhum caminho for encontrado, retorna a CRN original
-        return crn
+    return {'nodes': nodes, 'edges': optimized_edges}
 
 
-def plot_crn(crn, title):
-    G = nx.DiGraph()
-    G.add_nodes_from(crn['nodes'])
-    G.add_edges_from(crn['edges'])
-    plt.figure(figsize=(8, 6))
-    nx.draw(G, with_labels=True, node_size=700, font_size=10, font_color='white')
-    plt.title(title)
-    plt.savefig(f"{title}.png")
-    print(f"Gráfico salvo como {title}.png")
+def optimize_crn(crn, model_template):
+    """
+    Otimiza uma CRN baseada em predições do modelo.
 
-# Ajuste no script principal
+    Args:
+        crn (dict): CRN contendo 'nodes' e 'edges'.
+        model_template (ReactionOptimizerGNN): Modelo treinado.
+
+    Returns:
+        dict: CRN otimizada.
+    """
+    # Converte a CRN para grafo
+    data, _ = convert_crn_to_graph(crn)
+
+    # Ajusta o modelo para a dimensão de entrada do grafo
+    input_dim = data.x.shape[1]
+    model = adjust_model_to_graph(model_template, input_dim)
+
+    # Previsões
+    model.eval()
+    with torch.no_grad():
+        predictions = torch.sigmoid(model(data)).squeeze().tolist()
+
+    # Seleciona arestas relevantes
+    threshold = 0.5
+    selected_edges = [
+        crn['edges'][i] for i, score in enumerate(predictions[:len(crn['edges'])])
+        if score > threshold
+    ]
+
+    # Retorna a CRN otimizada
+    return {
+        'nodes': crn['nodes'],
+        'edges': selected_edges
+    }
+
+
+
 if __name__ == "__main__":
-    # Gera um conjunto de CRNs sintéticas
     synthetic_crns = generate_dataset(num_samples=10, max_molecules=10, max_reactions=7)
 
-    # Exibe exemplos de CRNs geradas
     for i, crn in enumerate(synthetic_crns[:3]):
         print(f"CRN {i + 1}:")
         print(crn)
         print()
 
-    # Treina o modelo usando as CRNs sintéticas
     trained_model = train_model(synthetic_crns)
 
-    # Exemplo de uma CRN para otimização
     crn_example = {
-        'nodes': ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'Z'],
-        'edges': [
-            (['A', 'B'], 'Z'),  # A + B -> C
-            (['C', 'D'], 'E'),  # C + D -> E
-            (['E', 'F'], 'G')   # E + F -> G
-        ]
-    }
+    'nodes': ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'Z'],
+    'edges': [
+        (['A', 'B'], 'Z'),
+        (['C', 'D'], 'E'),
+        (['E', 'F'], 'G')
+    ]
+}
 
-    # Otimiza a CRN
+
     optimized_crn = optimize_crn(crn_example, trained_model)
-
-    # Exibe o resultado
     print("CRN Original:")
     print(crn_example)
     print("\nCRN Otimizada:")
