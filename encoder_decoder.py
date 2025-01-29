@@ -1,112 +1,178 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import random
-import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from rdkit import Chem
 
-# Configuração do modelo molecular pré-treinado
-def load_molecular_model(model_name="seyonec/ChemBERTa-zinc-base-v1"):
+# -------------------------------
+# 1. Carregar Modelo Transformer
+# -------------------------------
+def load_molecular_model(model_name="t5-small"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
     return tokenizer, model
 
-# Gerar simplificações iniciais com o modelo pré-treinado
-def generate_simplifications(model, tokenizer, reactions, max_length=100, num_return_sequences=10):
+# -------------------------------
+# 2. Geração de Reações Químicas
+# -------------------------------
+def generate_simplifications(model, tokenizer, input_reactions, num_return_sequences=5):
     """
-    Gera simplificações iniciais para as reações fornecidas.
-
-    Args:
-        model: Modelo de geração (Transformer).
-        tokenizer: Tokenizer associado ao modelo.
-        reactions: Lista de reações químicas como entrada.
-        max_length: Comprimento máximo das sequências geradas.
-        num_return_sequences: Número de sequências geradas para cada entrada.
-
-    Returns:
-        Lista de simplificações geradas.
+    Gera simplificações de reações químicas usando um modelo Transformer.
     """
-    inputs = tokenizer(reactions, return_tensors="pt", padding=True, truncation=True)
+    input_text = "Simplify: " + " | ".join(input_reactions)
+    inputs = tokenizer.encode(input_text, return_tensors="pt")
+
     outputs = model.generate(
-        **inputs,
-        max_length=max_length,
+        inputs,
+        max_length=100,
+        num_beams=max(5, num_return_sequences),
         num_return_sequences=num_return_sequences,
         temperature=0.7,
-        do_sample=True,  # Habilita amostragem para gerar múltiplas sequências
+        do_sample=True
     )
-    return [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
 
+    generated = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
 
-# Avaliar a validade química (simples validação de formato)
-def validate_reaction(reaction):
-    try:
-        reactants, products = reaction.split("->")
-        reactants = [r.strip() for r in reactants.split("+")]
-        products = [p.strip() for p in products.split("+")]
-        return all(reactants) and all(products)
-    except Exception:
-        return False
+    # Limpar saída: remover palavras-chave adicionais e separar corretamente
+    cleaned_generated = []
+    for g in generated:
+        g = g.replace("Simplify:", "").replace("Simplifier:", "").replace("Simplification:", "").replace("Simplifying:", "").strip()
+        reactions = g.split("|")
+        for reaction in reactions:
+            reaction = reaction.strip()
+            if "->" in reaction:
+                cleaned_generated.append(reaction)
 
-# Funções do algoritmo evolutivo
+    return cleaned_generated
+
+# -------------------------------
+# 3. Validação das Reações Geradas
+# -------------------------------
+def validate_chemical_reactions(reactions):
+    """
+    Valida uma lista de reações químicas e remove aquelas que não seguem o formato correto.
+    """
+    valid_reactions = []
+
+    for reaction in reactions:
+        try:
+            if "->" not in reaction:
+                continue  # Ignorar strings inválidas
+
+            reactants, products = reaction.split("->")
+            reactants = [r.strip() for r in reactants.split("+")]
+            products = [p.strip() for p in products.split("+")]
+
+            # Validar formato correto (evitar caracteres aleatórios)
+            if not all(reactants) or not all(products):
+                continue  # Ignorar reações malformadas
+
+            valid_reactions.append(reaction)
+
+        except Exception as e:
+            print(f"Erro ao validar reação '{reaction}': {e}")
+
+    if not valid_reactions:
+        print("Nenhuma reação válida foi gerada. Mantendo a reação original.")
+        return reactions[:1]  # Pelo menos manter uma reação
+
+    return valid_reactions
+
+# -------------------------------
+# 4. Função de Avaliação de Fitness
+# -------------------------------
+def fitness(simplified_reaction):
+    """
+    Calcula a aptidão da solução simplificada.
+    Deve considerar o número de reações eliminadas e a correção química.
+    """
+    simplified_count = len(simplified_reaction.split("|"))  # Assume que reações são separadas por "|"
+    return -simplified_count  # Minimizar o número de reações
+
+# -------------------------------
+# 5. Operação de Cruzamento e Mutação
+# -------------------------------
 def crossover(parent1, parent2):
-    split_point = random.randint(1, len(parent1.split("->")[0]))
-    child1 = parent1[:split_point] + parent2[split_point:]
-    child2 = parent2[:split_point] + parent1[split_point:]
-    return child1, child2
+    """
+    Realiza o cruzamento entre duas reações simplificadas.
+    """
+    split_point = random.randint(1, len(parent1) - 1)
+    child = parent1[:split_point] + parent2[split_point:]
+    return child
 
 def mutate(reaction):
+    """
+    Aplica mutação na reação química.
+    """
     if "->" in reaction:
-        reactants, products = reaction.split("->")
+        reactants, product = reaction.split("->")
         reactants = reactants.split("+")
-        random.shuffle(reactants)
-        return f"{'+'.join(reactants)} -> {products.strip()}"
+        if len(reactants) > 1:
+            random.shuffle(reactants)  # Misturar os reagentes
+        reaction = f"{'+'.join(reactants)} -> {product}"
     return reaction
 
-# Função de avaliação (fitness)
-def fitness(reaction):
-    return -len(reaction) if validate_reaction(reaction) else float('inf')
+# -------------------------------
+# 6. Algoritmo Evolutivo para Otimização
+# -------------------------------
+def genetic_algorithm(original_reactions, model, tokenizer, generations=50, population_size=10):
+    """
+    Algoritmo genético para encontrar a melhor simplificação de reações químicas.
+    """
+    # Criar a população inicial gerando simplificações das reações
+    population = generate_simplifications(model, tokenizer, original_reactions, num_return_sequences=population_size)
+    
+    # Filtrar reações inválidas
+    population = validate_chemical_reactions(population)
 
-# Algoritmo Evolutivo
-def genetic_algorithm(reactions, model, tokenizer, generations=50, population_size=10):
-    # Geração inicial com simplificações do modelo
-    population = generate_simplifications(model, tokenizer, reactions, num_return_sequences=population_size)
+    for generation in range(1, generations + 1):
+        # Avaliar a aptidão (fitness)
+        fitness_scores = [fitness(ind) for ind in population]
 
-    for generation in range(generations):
-        population = [r for r in population if validate_reaction(r)]  # Filtrar reações inválidas
-        population = sorted(population, key=fitness)  # Ordenar pela melhor fitness
+        # Selecionar os melhores indivíduos (elitismo)
+        sorted_population = [x for _, x in sorted(zip(fitness_scores, population), reverse=True)]
+        parents = sorted_population[:2]
 
-        next_generation = population[:2]  # Elitismo: manter os 2 melhores
+        # Caso não tenha pais suficientes, manter a reação original como fallback
+        if len(parents) < 2:
+            parents = original_reactions[:2]
 
-        while len(next_generation) < population_size:
-            parent1, parent2 = random.sample(population[:5], 2)  # Seleção dos melhores
-            child1, child2 = crossover(parent1, parent2)
-            next_generation.extend([mutate(child1), mutate(child2)])
+        # Gerar nova população
+        new_population = parents[:]
+        while len(new_population) < population_size:
+            parent1, parent2 = random.sample(parents, 2)
+            child = crossover(parent1, parent2)
+            child = mutate(child)
+            new_population.append(child)
 
-        population = next_generation
+        # Atualizar população
+        population = validate_chemical_reactions(new_population)
 
         # Melhor fitness da geração atual
-        best_fitness = fitness(population[0])
-        print(f"Generation {generation + 1}: Best Fitness = {best_fitness}")
+        best_fitness = max(fitness_scores)
+        print(f"Generation {generation}: Best Fitness = {best_fitness}")
 
-        if best_fitness == -1:  # Parada antecipada se encontrar a melhor solução
-            break
+    # Melhor solução final
+    return sorted_population[0]
 
-    return population[0]  # Melhor solução encontrada
-
-# Função principal
+# -------------------------------
+# 7. Execução do Código
+# -------------------------------
 if __name__ == "__main__":
-    # Carregar modelo molecular
+    # Carregar modelo
     tokenizer, model = load_molecular_model()
 
-    # Exemplo de rede de reações
+    # Entrada de exemplo
     reactions = [
         "A + B -> C",
         "C + D -> E",
-        "E + F -> G"
+        "E + F -> G",
     ]
 
-    print("Reações originais:")
+    print("\nReações originais:")
     for r in reactions:
         print(r)
 
-    # Aplicar algoritmo evolutivo para simplificação
+    # Executar o algoritmo evolutivo
     best_solution = genetic_algorithm(reactions, model, tokenizer)
 
     print("\nMelhor solução simplificada:")
