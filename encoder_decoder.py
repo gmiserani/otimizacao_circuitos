@@ -32,7 +32,6 @@ def generate_simplifications(model, tokenizer, input_reactions, num_return_seque
 
     generated = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
 
-    # Limpar saída: remover palavras-chave adicionais e separar corretamente
     cleaned_generated = []
     for g in generated:
         g = g.replace("Simplify:", "").replace("Simplifier:", "").replace("Simplification:", "").replace("Simplifying:", "").strip()
@@ -56,15 +55,14 @@ def validate_chemical_reactions(reactions):
     for reaction in reactions:
         try:
             if "->" not in reaction:
-                continue  # Ignorar strings inválidas
+                continue
 
             reactants, products = reaction.split("->")
             reactants = [r.strip() for r in reactants.split("+")]
             products = [p.strip() for p in products.split("+")]
 
-            # Validar formato correto (evitar caracteres aleatórios)
             if not all(reactants) or not all(products):
-                continue  # Ignorar reações malformadas
+                continue
 
             valid_reactions.append(reaction)
 
@@ -73,7 +71,7 @@ def validate_chemical_reactions(reactions):
 
     if not valid_reactions:
         print("Nenhuma reação válida foi gerada. Mantendo a reação original.")
-        return reactions[:1]  # Pelo menos manter uma reação
+        return reactions[:1]
 
     return valid_reactions
 
@@ -85,8 +83,8 @@ def fitness(simplified_reaction):
     Calcula a aptidão da solução simplificada.
     Deve considerar o número de reações eliminadas e a correção química.
     """
-    simplified_count = len(simplified_reaction.split("|"))  # Assume que reações são separadas por "|"
-    return -simplified_count  # Minimizar o número de reações
+    simplified_count = len(simplified_reaction.split("|")) 
+    return -simplified_count
 
 # -------------------------------
 # 5. Operação de Cruzamento e Mutação
@@ -107,7 +105,7 @@ def mutate(reaction):
         reactants, product = reaction.split("->")
         reactants = reactants.split("+")
         if len(reactants) > 1:
-            random.shuffle(reactants)  # Misturar os reagentes
+            random.shuffle(reactants) 
         reaction = f"{'+'.join(reactants)} -> {product}"
     return reaction
 
@@ -118,25 +116,19 @@ def genetic_algorithm(original_reactions, model, tokenizer, generations=50, popu
     """
     Algoritmo genético para encontrar a melhor simplificação de reações químicas.
     """
-    # Criar a população inicial gerando simplificações das reações
     population = generate_simplifications(model, tokenizer, original_reactions, num_return_sequences=population_size)
     
-    # Filtrar reações inválidas
     population = validate_chemical_reactions(population)
 
     for generation in range(1, generations + 1):
-        # Avaliar a aptidão (fitness)
         fitness_scores = [fitness(ind) for ind in population]
 
-        # Selecionar os melhores indivíduos (elitismo)
         sorted_population = [x for _, x in sorted(zip(fitness_scores, population), reverse=True)]
         parents = sorted_population[:2]
 
-        # Caso não tenha pais suficientes, manter a reação original como fallback
         if len(parents) < 2:
             parents = original_reactions[:2]
 
-        # Gerar nova população
         new_population = parents[:]
         while len(new_population) < population_size:
             parent1, parent2 = random.sample(parents, 2)
@@ -144,24 +136,19 @@ def genetic_algorithm(original_reactions, model, tokenizer, generations=50, popu
             child = mutate(child)
             new_population.append(child)
 
-        # Atualizar população
         population = validate_chemical_reactions(new_population)
 
-        # Melhor fitness da geração atual
         best_fitness = max(fitness_scores)
         print(f"Generation {generation}: Best Fitness = {best_fitness}")
 
-    # Melhor solução final
     return sorted_population[0]
 
 # -------------------------------
 # 7. Execução do Código
 # -------------------------------
 if __name__ == "__main__":
-    # Carregar modelo
     tokenizer, model = load_molecular_model()
 
-    # Entrada de exemplo
     reactions = [
         "A + B -> C",
         "C + D -> E",
@@ -172,7 +159,6 @@ if __name__ == "__main__":
     for r in reactions:
         print(r)
 
-    # Executar o algoritmo evolutivo
     best_solution = genetic_algorithm(reactions, model, tokenizer)
 
     print("\nMelhor solução simplificada:")
